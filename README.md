@@ -2,7 +2,7 @@
 
 ## Ce qui a été corrigé / ajouté
 
-### Corrections (vos 2 bugs)
+### Corrections (2 bugs)
 
 1. **Connexion Google → "Unmatched Route"** : la route `/auth-callback`
    n'existait pas. Elle a été créée (`app/auth-callback.tsx`) et enregistrée
