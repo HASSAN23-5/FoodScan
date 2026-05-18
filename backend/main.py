@@ -19,10 +19,19 @@ def mk_at(uid, email): return jwt.encode({"sub": uid, "email": email, "exp": dat
 def mk_rt(uid): return jwt.encode({"sub": uid, "exp": datetime.now(timezone.utc)+timedelta(days=7), "type": "refresh"}, jwt_secret(), algorithm=JWT_ALG)
 
 # ============================
-# OLLAMA CONFIGURATION
+# IA CONFIGURATION - GROQ (cloud) ou OLLAMA (local)
 # ============================
-OLLAMA_URL = "http://localhost:11434"
-OLLAMA_MODEL = "llama3.2:1b"  # Petit modèle rapide. Fallback rule-based si échec.
+# Mode AUTO: si GROQ_API_KEY est défini → utilise Groq (rapide, cloud)
+#            sinon → tente Ollama (local)
+# Si les deux échouent → fallback rule-based intelligent
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.1-8b-instant")  # rapide et gratuit
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
+
+USE_GROQ = bool(GROQ_API_KEY)
 
 app = FastAPI(title="FoodScan API")
 api = APIRouter(prefix="/api")
@@ -415,6 +424,89 @@ def _smart_fallback(d: AltReq, objectives: Optional[Dict[str, Any]] = None) -> D
     }
 
 
+async def _call_groq(system_prompt: str, user_prompt: str, max_tokens: int = 1024) -> Optional[Dict[str, Any]]:
+    """
+    Appelle Groq Cloud API et renvoie le JSON parsé, ou None en cas d'échec.
+    Groq est gratuit, hébergé, très rapide (1-2s). Modèle par défaut: llama-3.1-8b-instant.
+    """
+    if not GROQ_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as c:
+            r = await c.post(
+                GROQ_URL,
+                headers={
+                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": max_tokens,
+                    "response_format": {"type": "json_object"},  # force JSON
+                },
+            )
+            if r.status_code != 200:
+                logging.warning(f"Groq returned status {r.status_code}: {r.text[:200]}")
+                return None
+            content = r.json()["choices"][0]["message"]["content"]
+            parsed = json.loads(content)
+            logging.info(f"Groq ({GROQ_MODEL}) returned valid JSON")
+            return parsed
+    except json.JSONDecodeError as je:
+        logging.warning(f"Groq JSON parse error: {je}")
+        return None
+    except httpx.TimeoutException:
+        logging.warning("Groq timeout (>30s)")
+        return None
+    except Exception as e:
+        logging.error(f"Groq error: {e}")
+        return None
+
+
+async def _call_ollama(system_prompt: str, user_prompt: str, max_tokens: int = 1024) -> Optional[Dict[str, Any]]:
+    """Appelle Ollama en local et renvoie le JSON parsé, ou None en cas d'échec."""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as c:
+            response = await c.post(
+                f"{OLLAMA_URL}/api/chat",
+                json={
+                    "model": OLLAMA_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    "stream": False,
+                    "format": "json",
+                    "options": {"temperature": 0.7, "num_predict": max_tokens},
+                },
+            )
+            if response.status_code != 200:
+                logging.warning(f"Ollama returned status {response.status_code}")
+                return None
+            content = response.json().get("message", {}).get("content", "")
+            if not content:
+                return None
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                start = content.find('{')
+                end = content.rfind('}') + 1
+                if start >= 0 and end > start:
+                    return json.loads(content[start:end])
+                return None
+    except httpx.ConnectError:
+        logging.warning(f"Cannot connect to Ollama at {OLLAMA_URL}")
+        return None
+    except Exception as e:
+        logging.error(f"Ollama error: {e}")
+        return None
+
+
 @products.post("/alternatives")
 async def get_alternatives(d: AltReq, req: Request):
     """
@@ -459,70 +551,25 @@ Réponds UNIQUEMENT en JSON valide avec ce format exact, rien d'autre :
   "general_advice": "Un conseil nutritionnel général pour cette catégorie de produits"
 }}"""
 
-    models_to_try = [OLLAMA_MODEL]
+    system_prompt = "Tu es un nutritionniste expert. Tu réponds toujours en JSON valide, sans texte supplémentaire. Tes réponses sont en français."
 
-    for model in models_to_try:
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as c:
-                response = await c.post(
-                    f"{OLLAMA_URL}/api/chat",
-                    json={
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": "Tu es un nutritionniste expert. Tu réponds toujours en JSON valide, sans texte supplémentaire. Tes réponses sont en français."},
-                            {"role": "user", "content": prompt}
-                        ],
-                        "stream": False,
-                        "format": "json",
-                        "options": {"temperature": 0.7, "num_predict": 1024}
-                    }
-                )
+    # 1. Try Groq first (cloud, fast) if API key is set
+    if USE_GROQ:
+        parsed = await _call_groq(system_prompt, prompt, max_tokens=1024)
+        if parsed and "alternatives" in parsed and isinstance(parsed["alternatives"], list):
+            parsed["source"] = f"groq:{GROQ_MODEL}"
+            logging.info(f"Groq generated {len(parsed['alternatives'])} alternatives")
+            return parsed
 
-                if response.status_code != 200:
-                    logging.warning(f"Ollama model {model} returned status {response.status_code}")
-                    continue
+    # 2. Try Ollama (local)
+    parsed = await _call_ollama(system_prompt, prompt, max_tokens=1024)
+    if parsed and "alternatives" in parsed and isinstance(parsed["alternatives"], list):
+        parsed["source"] = f"ollama:{OLLAMA_MODEL}"
+        logging.info(f"Ollama generated {len(parsed['alternatives'])} alternatives")
+        return parsed
 
-                result = response.json()
-                content = result.get("message", {}).get("content", "")
-
-                if not content:
-                    logging.warning(f"Ollama model {model} returned empty content")
-                    continue
-
-                try:
-                    parsed = json.loads(content)
-                    if "alternatives" in parsed and isinstance(parsed["alternatives"], list):
-                        parsed["source"] = f"ollama:{model}"
-                        logging.info(f"Ollama ({model}) generated {len(parsed['alternatives'])} alternatives")
-                        return parsed
-                    else:
-                        logging.warning(f"Ollama ({model}) returned invalid structure: {content[:200]}")
-                        continue
-                except json.JSONDecodeError as je:
-                    logging.warning(f"Ollama ({model}) JSON parse error: {je}")
-                    try:
-                        start = content.find('{')
-                        end = content.rfind('}') + 1
-                        if start >= 0 and end > start:
-                            parsed = json.loads(content[start:end])
-                            if "alternatives" in parsed:
-                                parsed["source"] = f"ollama:{model}-recovered"
-                                return parsed
-                    except:
-                        pass
-                    continue
-
-        except httpx.ConnectError:
-            logging.error(f"Cannot connect to Ollama at {OLLAMA_URL}. Is Ollama running?")
-            break
-        except httpx.TimeoutException:
-            logging.warning(f"Ollama model {model} timeout (>120s)")
-            continue
-        except Exception as e:
-            logging.error(f"Ollama error with model {model}: {e}")
-            continue
-
-    logging.warning("All Ollama models failed. Using smart rule-based fallback.")
+    # 3. Fall back to rule-based
+    logging.warning("All AI backends failed. Using smart rule-based fallback.")
     return _smart_fallback(d, objectives)
 
 
@@ -565,44 +612,22 @@ Réponds en JSON valide, format strict :
   ]
 }}"""
 
-    for model in [OLLAMA_MODEL]:
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as c:
-                r = await c.post(
-                    f"{OLLAMA_URL}/api/chat",
-                    json={
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": "Tu es un coach nutritionnel. Tu réponds uniquement en JSON valide en français."},
-                            {"role": "user", "content": prompt}
-                        ],
-                        "stream": False,
-                        "format": "json",
-                        "options": {"temperature": 0.7, "num_predict": 700}
-                    }
-                )
-                if r.status_code != 200:
-                    continue
-                content = r.json().get("message", {}).get("content", "")
-                try:
-                    parsed = json.loads(content)
-                    if "tips" in parsed:
-                        parsed["source"] = f"ollama:{model}"
-                        return parsed
-                except json.JSONDecodeError:
-                    try:
-                        start = content.find('{'); end = content.rfind('}') + 1
-                        if start >= 0 and end > start:
-                            parsed = json.loads(content[start:end])
-                            if "tips" in parsed:
-                                parsed["source"] = f"ollama:{model}-recovered"
-                                return parsed
-                    except: pass
-                    continue
-        except httpx.ConnectError:
-            break
-        except Exception:
-            continue
+    system_prompt = "Tu es un coach nutritionnel. Tu réponds uniquement en JSON valide en français."
+
+    # 1. Try Groq first
+    if USE_GROQ:
+        parsed = await _call_groq(system_prompt, prompt, max_tokens=700)
+        if parsed and "tips" in parsed:
+            parsed["source"] = f"groq:{GROQ_MODEL}"
+            return parsed
+
+    # 2. Try Ollama
+    parsed = await _call_ollama(system_prompt, prompt, max_tokens=700)
+    if parsed and "tips" in parsed:
+        parsed["source"] = f"ollama:{OLLAMA_MODEL}"
+        return parsed
+
+    # 3. Fall back to rule-based below
 
     # Fallback: rule-based advice from history + objectives
     tips: List[Dict[str, str]] = []
@@ -647,20 +672,39 @@ Réponds en JSON valide, format strict :
 # ============================
 # ENDPOINT TEST OLLAMA
 # ============================
+@products.get("/ai-status")
+async def check_ai():
+    """Renvoie le statut des backends IA disponibles (Groq + Ollama)."""
+    result = {
+        "groq": {"configured": USE_GROQ, "model": GROQ_MODEL if USE_GROQ else None},
+        "ollama": {"url": OLLAMA_URL, "model": OLLAMA_MODEL, "status": "unknown"},
+        "active_backend": "groq" if USE_GROQ else "ollama",
+        "fallback": "rule-based-intelligent",
+    }
+    # Probe Ollama if Groq isn't configured
+    if not USE_GROQ:
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as c:
+                r = await c.get(f"{OLLAMA_URL}/api/tags")
+                if r.status_code == 200:
+                    models = [m["name"] for m in r.json().get("models", [])]
+                    result["ollama"]["status"] = "connected"
+                    result["ollama"]["installed_models"] = models
+                else:
+                    result["ollama"]["status"] = f"error_{r.status_code}"
+        except httpx.ConnectError:
+            result["ollama"]["status"] = "disconnected"
+            result["active_backend"] = "rule-based-fallback"
+        except Exception as e:
+            result["ollama"]["status"] = f"error: {e}"
+    return result
+
+
+# Legacy alias kept for the existing frontend code
 @products.get("/ollama-status")
 async def check_ollama():
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as c:
-            r = await c.get(f"{OLLAMA_URL}/api/tags")
-            if r.status_code == 200:
-                models = [m["name"] for m in r.json().get("models", [])]
-                return {"status": "connected", "url": OLLAMA_URL, "models": models, "default_model": OLLAMA_MODEL}
-            else:
-                return {"status": "error", "message": f"Ollama responded with status {r.status_code}"}
-    except httpx.ConnectError:
-        return {"status": "disconnected", "message": f"Cannot connect to Ollama at {OLLAMA_URL}. Run: ollama serve"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    return await check_ai()
+
 
 # ============================
 # SCAN HISTORY
@@ -704,7 +748,13 @@ async def clear_history(req: Request):
 # ROOT
 # ============================
 @api.get("/")
-async def root(): return {"message": "FoodScan API", "status": "healthy", "ai_backend": "ollama", "model": OLLAMA_MODEL}
+async def root():
+    return {
+        "message": "FoodScan API",
+        "status": "healthy",
+        "ai_backend": "groq" if USE_GROQ else "ollama",
+        "model": GROQ_MODEL if USE_GROQ else OLLAMA_MODEL,
+    }
 
 api.include_router(auth)
 api.include_router(users)
@@ -733,16 +783,22 @@ async def startup():
             "created_at": datetime.now(timezone.utc).isoformat()
         })
         logging.info(f"Admin created: {ae}")
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as c:
-            r = await c.get(f"{OLLAMA_URL}/api/tags")
-            if r.status_code == 200:
-                models = [m["name"] for m in r.json().get("models", [])]
-                logging.info(f"Ollama connected. Available models: {models}")
-            else:
-                logging.warning(f"Ollama responded with status {r.status_code}")
-    except:
-        logging.warning(f"Ollama not reachable at {OLLAMA_URL}. AI alternatives will use fallback.")
+
+    # AI backend status
+    if USE_GROQ:
+        logging.info(f"AI backend: Groq ({GROQ_MODEL}) — cloud, fast")
+    else:
+        logging.info(f"AI backend: Ollama ({OLLAMA_MODEL}) — local")
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as c:
+                r = await c.get(f"{OLLAMA_URL}/api/tags")
+                if r.status_code == 200:
+                    models = [m["name"] for m in r.json().get("models", [])]
+                    logging.info(f"Ollama connected. Available models: {models}")
+                else:
+                    logging.warning(f"Ollama responded with status {r.status_code}. Will use fallback.")
+        except Exception:
+            logging.warning(f"Ollama not reachable at {OLLAMA_URL}. AI will use rule-based fallback.")
 
 @app.on_event("shutdown")
 async def shutdown(): client.close()
