@@ -2,7 +2,7 @@ import axios from 'axios';
 import { getToken } from './storage';
 
 // CHANGE THIS TO YOUR LOCAL IP ADDRESS
-const API_URL = 'http://172.28.15.234:8001/api';
+const API_URL = process.env.EXPO_PUBLIC_API_URL || 'https://web-production-49b46.up.railway.app/api';
 
 // Default timeout for fast endpoints (auth, profile, search, history...) — 30s is plenty.
 const DEFAULT_TIMEOUT = 30000;
